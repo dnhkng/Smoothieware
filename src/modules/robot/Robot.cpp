@@ -25,6 +25,7 @@ using std::string;
 #include "arm_solutions/CartesianSolution.h"
 #include "arm_solutions/RotatableCartesianSolution.h"
 #include "arm_solutions/LinearDeltaSolution.h"
+#include "arm_solutions/OrthagonalDeltaSolution.h"
 #include "arm_solutions/HBotSolution.h"
 #include "arm_solutions/MorganSCARASolution.h"
 #include "StepTicker.h"
@@ -50,6 +51,7 @@ using std::string;
 #define  rotatable_cartesian_checksum        CHECKSUM("rotatable_cartesian")
 #define  rostock_checksum                    CHECKSUM("rostock")
 #define  linear_delta_checksum               CHECKSUM("linear_delta")
+#define  orthagonal_delta_checksum           CHECKSUM("orthagonal_delta")
 #define  delta_checksum                      CHECKSUM("delta")
 #define  hbot_checksum                       CHECKSUM("hbot")
 #define  corexy_checksum                     CHECKSUM("corexy")
@@ -158,6 +160,9 @@ void Robot::on_config_reload(void *argument)
 
     } else if(solution_checksum == rostock_checksum || solution_checksum == kossel_checksum || solution_checksum == delta_checksum || solution_checksum ==  linear_delta_checksum) {
         this->arm_solution = new LinearDeltaSolution(THEKERNEL->config);
+
+    } else if(solution_checksum == orthagonal_delta_checksum) {
+        this->arm_solution = new OrthagonalDeltaSolution(THEKERNEL->config);
 
     } else if(solution_checksum == rotatable_cartesian_checksum) {
         this->arm_solution = new RotatableCartesianSolution(THEKERNEL->config);
