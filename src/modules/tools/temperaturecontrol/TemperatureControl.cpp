@@ -56,6 +56,7 @@
 #define d_factor_checksum                  CHECKSUM("d_factor")
 
 #define i_max_checksum                     CHECKSUM("i_max")
+#define windup_checksum                    CHECKSUM("windup")
 
 #define preset1_checksum                   CHECKSUM("preset1")
 #define preset2_checksum                   CHECKSUM("preset2")
@@ -80,6 +81,7 @@ void TemperatureControl::on_module_loaded()
 
     // We start not desiring any temp
     this->target_temperature = UNDEFINED;
+    this->sensor_settings= false; // set to true if sensor settings have been overriden
 
     // Settings
     this->load_config();
@@ -166,6 +168,7 @@ void TemperatureControl::load_config()
         // used to enable bang bang control of heater
         this->use_bangbang = THEKERNEL->config->value(temperature_control_checksum, this->name_checksum, bang_bang_checksum)->by_default(false)->as_bool();
         this->hysteresis = THEKERNEL->config->value(temperature_control_checksum, this->name_checksum, hysteresis_checksum)->by_default(2)->as_number();
+        this->windup = THEKERNEL->config->value(temperature_control_checksum, this->name_checksum, windup_checksum)->by_default(false)->as_bool();
         this->heater_pin.max_pwm( THEKERNEL->config->value(temperature_control_checksum, this->name_checksum, max_pwm_checksum)->by_default(255)->as_number() );
         this->heater_pin.set(0);
         set_low_on_debug(heater_pin.port_number, heater_pin.pin);
@@ -219,13 +222,46 @@ void TemperatureControl::on_gcode_received(void *argument)
                 if (gcode->has_letter('D'))
                     setPIDd( gcode->get_value('D') );
                 if (gcode->has_letter('X'))
-                    this->i_max    = gcode->get_value('X');
+                    this->i_max = gcode->get_value('X');
+                if (gcode->has_letter('Y'))
+                    this->heater_pin.max_pwm(gcode->get_value('Y'));
+
+            }else if(!gcode->has_letter('S')) {
+                gcode->stream->printf("%s(S%d): Pf:%g If:%g Df:%g X(I_max):%g max pwm: %d O:%d\n", this->designator.c_str(), this->pool_index, this->p_factor, this->i_factor / this->PIDdt, this->d_factor * this->PIDdt, this->i_max, this->heater_pin.max_pwm(), o);
             }
-            //gcode->stream->printf("%s(S%d): Pf:%g If:%g Df:%g X(I_max):%g Pv:%g Iv:%g Dv:%g O:%d\n", this->designator.c_str(), this->pool_index, this->p_factor, this->i_factor/this->PIDdt, this->d_factor*this->PIDdt, this->i_max, this->p, this->i, this->d, o);
-            gcode->stream->printf("%s(S%d): Pf:%g If:%g Df:%g X(I_max):%g O:%d\n", this->designator.c_str(), this->pool_index, this->p_factor, this->i_factor / this->PIDdt, this->d_factor * this->PIDdt, this->i_max, o);
+
+        } else if (gcode->m == 305) { // set sensor settings
+            gcode->mark_as_taken();
+            if (gcode->has_letter('S') && (gcode->get_value('S') == this->pool_index)) {
+                this->sensor_settings= true;
+                TempSensor::sensor_options_t options;
+                if(sensor->get_optional(options)) {
+                    for(auto &i : options) {
+                        // foreach optional value
+                        char c = i.first;
+                        if(gcode->has_letter(c)) { // set new value
+                            i.second = gcode->get_value(c);
+                        }
+                    }
+                    // set the new options
+                    sensor->set_optional(options);
+                }
+            }
 
         } else if (gcode->m == 500 || gcode->m == 503) { // M500 saves some volatile settings to config override file, M503 just prints the settings
-            gcode->stream->printf(";PID settings:\nM301 S%d P%1.4f I%1.4f D%1.4f\n", this->pool_index, this->p_factor, this->i_factor / this->PIDdt, this->d_factor * this->PIDdt);
+            gcode->stream->printf(";PID settings:\nM301 S%d P%1.4f I%1.4f D%1.4f X%1.4f Y%d\n", this->pool_index, this->p_factor, this->i_factor / this->PIDdt, this->d_factor * this->PIDdt, this->i_max, this->heater_pin.max_pwm());
+
+            if(this->sensor_settings) {
+                // get or save any sensor specific optional values
+                TempSensor::sensor_options_t options;
+                if(sensor->get_optional(options) && !options.empty()) {
+                    gcode->stream->printf(";Optional temp sensor specific settings:\nM305 S%d", this->pool_index);
+                    for(auto &i : options) {
+                        gcode->stream->printf(" %c%1.4f", i.first, i.second);
+                    }
+                    gcode->stream->printf("\n");
+                }
+            }
             gcode->mark_as_taken();
 
         } else if( ( gcode->m == this->set_m_code || gcode->m == this->set_and_wait_m_code ) && gcode->has_letter('S')) {
@@ -329,14 +365,25 @@ void TemperatureControl::set_desired_temperature(float desired_temperature)
         desired_temperature = this->max_temp;
     }
 
-    if (desired_temperature == 1.0)
+    if (desired_temperature == 1.0F)
         desired_temperature = preset1;
-    else if (desired_temperature == 2.0)
+    else if (desired_temperature == 2.0F)
         desired_temperature = preset2;
 
+    float last_target_temperature= target_temperature;
     target_temperature = desired_temperature;
-    if (desired_temperature == 0.0)
+    if (desired_temperature == 0.0F){
+        // turning it off
         heater_pin.set((this->o = 0));
+
+    }else if(last_target_temperature == 0.0F) {
+        // if it was off and we are now turning it on we need to initialize
+        this->lastInput= last_reading;
+        // set to whatever the output currently is See http://brettbeauregard.com/blog/2011/04/improving-the-beginner%E2%80%99s-pid-initialization/
+        this->iTerm= this->o;
+        if (this->iTerm > this->i_max) this->iTerm = this->i_max;
+        else if (this->iTerm < 0.0) this->iTerm = 0.0;
+    }
 }
 
 float TemperatureControl::get_temperature()
@@ -359,7 +406,7 @@ uint32_t TemperatureControl::thermistor_read_tick(uint32_t dummy)
             heater_pin.set((this->o = 0));
         } else {
             pid_process(temperature);
-            if ((temperature > target_temperature) && waiting) {
+            if ( waiting && (temperature >= target_temperature) ) {
                 THEKERNEL->pauser->release();
                 waiting = false;
             }
@@ -399,21 +446,24 @@ void TemperatureControl::pid_process(float temperature)
 
     // regular PID control
     float error = target_temperature - temperature;
-    this->iTerm += (error * this->i_factor);
-    if (this->iTerm > this->i_max) this->iTerm = this->i_max;
-    else if (this->iTerm < 0.0) this->iTerm = 0.0;
 
-    if(this->lastInput < 0.0) this->lastInput = temperature; // set first time
+    float new_I = this->iTerm + (error * this->i_factor);
+    if (new_I > this->i_max) new_I = this->i_max;
+    else if (new_I < 0.0) new_I = 0.0;
+    if(!this->windup) this->iTerm= new_I;
+
     float d = (temperature - this->lastInput);
 
     // calculate the PID output
     // TODO does this need to be scaled by max_pwm/256? I think not as p_factor already does that
-    this->o = (this->p_factor * error) + this->iTerm - (this->d_factor * d);
+    this->o = (this->p_factor * error) + new_I - (this->d_factor * d);
 
     if (this->o >= heater_pin.max_pwm())
         this->o = heater_pin.max_pwm();
     else if (this->o < 0)
         this->o = 0;
+    else if(this->windup)
+        this->iTerm = new_I; // Only update I term when output is not saturated.
 
     this->heater_pin.pwm(this->o);
     this->lastInput = temperature;
