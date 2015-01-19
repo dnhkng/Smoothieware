@@ -1,3 +1,6 @@
+==Arm variant
+This fork introduces a new arm system; the orthagonal delta configuration. Currently, this works well nicely, but automated bed-levelling needs to be rewritten.
+
 ==Overview
 Smoothie is a free, opensource, high performance G-code interpreter and CNC controller written in Object-Oriented C++ for the LPC17xx micro-controller ( ARM Cortex M3 architecture ). It will run on a mBed, a LPCXpresso, a SmoothieBoard, R2C2 or any other LPC17xx-based board. The motion control part is a port of the awesome grbl.
 
