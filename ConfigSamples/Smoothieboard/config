@@ -5,7 +5,7 @@ default_seek_rate                            4000             # Default rate ( m
 mm_per_arc_segment                           0.5              # Arcs are cut into segments ( lines ), this is the length for
                                                               # these segments.  Smaller values mean more resolution,
                                                               # higher values mean faster computation
-mm_per_line_segment                          5                # Lines can be cut into segments ( not usefull with cartesian
+#mm_per_line_segment                          5                # Lines can be cut into segments ( not usefull with cartesian
                                                               # coordinates robots ).
 
 # Arm solution configuration : Cartesian robot. Translates mm positions into stepper positions
@@ -28,7 +28,7 @@ junction_deviation                           0.05             # Similar to the o
 
 # Stepper module configuration
 microseconds_per_step_pulse                  1                # Duration of step pulses to stepper drivers, in microseconds
-base_stepping_frequency                      100000           # Base frequency for stepping, higher gives smoother movement
+base_stepping_frequency                      100000           # Base frequency for stepping
 
 # Cartesian axis speed limits
 x_axis_max_speed                             30000            # mm/min
@@ -71,7 +71,7 @@ pause_button_enable                          true             # Pause button ena
 extruder.hotend.enable                          true             # Whether to activate the extruder module at all. All configuration is ignored if false
 extruder.hotend.steps_per_mm                    140              # Steps per mm for extruder stepper
 extruder.hotend.default_feed_rate               600              # Default rate ( mm/minute ) for moves where only the extruder moves
-extruder.hotend.acceleration                    500              # Acceleration for the stepper motor, as of 0.6, arbitrary ratio
+extruder.hotend.acceleration                    500              # Acceleration for the stepper motor mm/sec²
 extruder.hotend.max_speed                       50               # mm/s
 
 extruder.hotend.step_pin                        2.3              # Pin for extruder step signal
@@ -130,6 +130,8 @@ temperature_control.hotend.thermistor        EPCOS100K        # see http://smoot
 temperature_control.hotend.set_m_code        104              #
 temperature_control.hotend.set_and_wait_m_code 109            #
 temperature_control.hotend.designator        T                #
+#temperature_control.hotend.max_temp         250              # Set maximum temperature
+#temperature_control.hotend.min_temp         0                # Set minimum temperature - Will prevent heating below if set
 
 #temperature_control.hotend.p_factor         13.7             # permanently set the PID values after an auto pid
 #temperature_control.hotend.i_factor         0.097            #
@@ -185,7 +187,7 @@ switch.fan.output_type                       pwm              # pwm output setta
 
 # automatically toggle a switch at a specified temperature. Different ones of these may be defined to monitor different temperatures and switch different swithxes
 # useful to turn on a fan or water pump to cool the hotend
-#temperatureswitch.hotend.enable	            true             #
+#temperatureswitch.hotend.enable              true             #
 #temperatureswitch.hotend.designator          T                # first character of the temperature control designator to use as the temperature sensor to monitor
 #temperatureswitch.hotend.switch              misc             # select which switch to use, matches the name of the defined switch
 #temperatureswitch.hotend.threshold_temp      60.0             # temperature to turn on (if rising) or off the switch
@@ -312,3 +314,10 @@ network.ip_address                           auto             # use dhcp to get 
 #network.ip_mask                              255.255.255.0    # the ip mask
 #network.ip_gateway                           192.168.3.1      # the gateway address
 #network.mac_override                         xx.xx.xx.xx.xx.xx  # override the mac address, only do this if you have a conflict
+
+# Drills module
+# Implement the Canned Drilling Cycles
+# G80-83, G98, G99 in absolute mode only
+# Incremental mode not implemented (L)
+drillingcycles.enable                                false # enable module, default false
+drillingcycles.dwell_units                           S     # dwell units [S = seconds, P = millis], default: S
