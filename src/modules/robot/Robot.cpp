@@ -54,11 +54,8 @@ using std::string;
 #define  rotatable_cartesian_checksum        CHECKSUM("rotatable_cartesian")
 #define  rostock_checksum                    CHECKSUM("rostock")
 #define  linear_delta_checksum               CHECKSUM("linear_delta")
-<<<<<<< HEAD
 #define  orthagonal_delta_checksum           CHECKSUM("orthagonal_delta")
-=======
 #define  rotatable_delta_checksum            CHECKSUM("rotatable_delta")
->>>>>>> upstream/edge
 #define  delta_checksum                      CHECKSUM("delta")
 #define  hbot_checksum                       CHECKSUM("hbot")
 #define  corexy_checksum                     CHECKSUM("corexy")
