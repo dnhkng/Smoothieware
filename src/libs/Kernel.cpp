@@ -24,10 +24,12 @@
 #include "modules/robot/Robot.h"
 #include "modules/robot/Stepper.h"
 #include "modules/robot/Conveyor.h"
-#include "modules/robot/Pauser.h"
+#include "StepperMotor.h"
+#include "BaseSolution.h"
 
 #include <malloc.h>
 #include <array>
+#include <string>
 
 #define baud_rate_setting_checksum CHECKSUM("baud_rate")
 #define uart0_checksum             CHECKSUM("uart0")
@@ -35,11 +37,14 @@
 #define base_stepping_frequency_checksum            CHECKSUM("base_stepping_frequency")
 #define microseconds_per_step_pulse_checksum        CHECKSUM("microseconds_per_step_pulse")
 #define acceleration_ticks_per_second_checksum      CHECKSUM("acceleration_ticks_per_second")
+#define disable_leds_checksum                       CHECKSUM("leds_disable")
 
 Kernel* Kernel::instance;
 
 // The kernel is the central point in Smoothie : it stores modules, and handles event calls
 Kernel::Kernel(){
+    halted= false;
+
     instance= this; // setup the Singleton instance of the kernel
 
     // serial first at fixed baud rate (DEFAULT_SERIAL_BAUD_RATE) so config can report errors to serial
@@ -84,6 +89,9 @@ Kernel::Kernel(){
     if(this->serial == NULL) {
         this->serial = new SerialConsole(USBTX, USBRX, this->config->value(uart0_checksum,baud_rate_setting_checksum)->by_default(DEFAULT_SERIAL_BAUD_RATE)->as_number());
     }
+
+    //some boards don't have leds.. TOO BAD!
+    this->use_leds= !this->config->value( disable_leds_checksum )->by_default(false)->as_bool();
 
     this->add_module( this->config );
     this->add_module( this->serial );
@@ -131,14 +139,50 @@ Kernel::Kernel(){
     this->step_ticker->set_acceleration_ticks_per_second(acceleration_ticks_per_second); // must be set after set_frequency
 
     // Core modules
-    this->add_module( new GcodeDispatch() );
+    this->add_module( this->gcode_dispatch = new GcodeDispatch() );
     this->add_module( this->robot          = new Robot()         );
     this->add_module( this->stepper        = new Stepper()       );
     this->add_module( this->conveyor       = new Conveyor()      );
-    this->add_module( this->pauser         = new Pauser()        );
 
     this->planner = new Planner();
 
+}
+
+// return a GRBL-like query string for serial ?
+std::string Kernel::get_query_string()
+{
+    std::string str;
+    str.append("<");
+    if(halted) {
+        str.append("Alarm,");
+    }else if(this->conveyor->is_queue_empty()) {
+        str.append("Idle,");
+    }else{
+        str.append("Run,");
+    }
+
+    // get real time current actuator position in mm
+    ActuatorCoordinates current_position{
+        robot->actuators[X_AXIS]->get_current_position(),
+        robot->actuators[Y_AXIS]->get_current_position(),
+        robot->actuators[Z_AXIS]->get_current_position()
+    };
+
+    // get machine position from the actuator position using FK
+    float mpos[3];
+    robot->arm_solution->actuator_to_cartesian(current_position, mpos);
+
+    char buf[64];
+    // machine position
+    size_t n= snprintf(buf, sizeof(buf), "%f,%f,%f,", mpos[0], mpos[1], mpos[2]);
+    str.append("MPos:").append(buf, n);
+
+    // work space position
+    Robot::wcs_t pos= robot->mcs2wcs(mpos);
+    n= snprintf(buf, sizeof(buf), "%f,%f,%f", robot->from_millimeters(std::get<X_AXIS>(pos)), robot->from_millimeters(std::get<Y_AXIS>(pos)), robot->from_millimeters(std::get<Z_AXIS>(pos)));
+    str.append("WPos:").append(buf, n);
+    str.append(">\r\n");
+    return str;
 }
 
 // Add a module to Kernel. We don't actually hold a list of modules we just call its on_module_loaded
@@ -151,16 +195,32 @@ void Kernel::register_for_event(_EVENT_ENUM id_event, Module *mod){
     this->hooks[id_event].push_back(mod);
 }
 
-// Call a specific event without arguments
-void Kernel::call_event(_EVENT_ENUM id_event){
-    for (auto m : hooks[id_event]) {
-        (m->*kernel_callback_functions[id_event])(this);
-    }
-}
-
 // Call a specific event with an argument
 void Kernel::call_event(_EVENT_ENUM id_event, void * argument){
+    if(id_event == ON_HALT) {
+        this->halted= (argument == nullptr);
+    }
     for (auto m : hooks[id_event]) {
         (m->*kernel_callback_functions[id_event])(argument);
     }
 }
+
+// These are used by tests to test for various things. basically mocks
+bool Kernel::kernel_has_event(_EVENT_ENUM id_event, Module *mod)
+{
+    for (auto m : hooks[id_event]) {
+        if(m == mod) return true;
+    }
+    return false;
+}
+
+void Kernel::unregister_for_event(_EVENT_ENUM id_event, Module *mod)
+{
+    for (auto i = hooks[id_event].begin(); i != hooks[id_event].end(); ++i) {
+        if(*i == mod) {
+            hooks[id_event].erase(i);
+            return;
+        }
+    }
+}
+

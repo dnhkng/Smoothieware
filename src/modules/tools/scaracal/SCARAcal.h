@@ -23,7 +23,6 @@ public:
     void on_config_reload(void *argument);
 
     void on_gcode_received(void *argument);
-//    void on_idle(void *argument);
 
 
 private:
@@ -39,6 +38,7 @@ private:
     void SCARA_ang_move(float theta, float psi, float z, float feedrate);
 
     float slow_rate;
+    float z_move;
 
     struct {
         bool           is_scara:1;

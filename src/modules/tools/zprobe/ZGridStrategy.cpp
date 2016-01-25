@@ -44,6 +44,10 @@
 
        leveling-strategy.ZGrid-leveling.wait_for_probe  true
 
+    The machine can be told to home in one of the following modes:
+
+       leveling-strategy.ZGrid-leveling.home_before_probe  homexyz;    #  nohome homexy homexyz (default)
+
 
     Slow feedrate can be defined for probe positioning speed.  Note this is not Probing slow rate - it can be set to a fast speed if required.
 
@@ -53,21 +57,26 @@
 
     Usage
     -----
-    G32 probes the probe points and defines the bed ZGrid, this will remain in effect until reset or M370
-    G31 reports the status
+    G32                  : probes the probe points and defines the bed ZGrid, this will remain in effect until reset or M370
+    G31                  : reports the status - Display probe data points
 
-    M370 clears the ZGrid and the bed leveling is disabled until G32 is run again
-    M370 X7 Y9 allocates a new grid size of 7x9 and clears as above
+    M370                 : clears the ZGrid and the bed levelling is disabled until G32 is run again
+    M370 X7 Y9           : allocates a new grid size of 7x9 and clears as above
 
-    M371 moves the head to the next calibration postion without saving for manual calibration
-    M372 move the head to the next calibration postion after saving the current probe point to memory - manual calbration
+    M371                 : moves the head to the next calibration position without saving for manual calibration
+    M372                 : move the head to the next calibration position after saving the current probe point to memory - manual calbration
+    M373                 : completes calibration and enables the Z compensation grid
 
-    M373 completes calibration and enables the Z compensation grid
+    M374                 : Save the grid to "Zgrid" on SD card
+    M374 S###            : Save custom grid to "Zgrid.###" on SD card
 
-    M
+    M375                 : Loads grid file "Zgrid" from SD
+    M375 S###            : Load custom grid file "Zgrid.###"
 
-    M500 saves the probe points and the probe offsets
-    M503 displays the current settings
+    M565 X### Y### Z###  : Set new probe offsets
+
+    M500                 : saves the probe offsets
+    M503                 : displays the current settings
 */
 
 #include "ZGridStrategy.h"
@@ -102,11 +111,15 @@
 #define slow_feedrate_checksum       CHECKSUM("slow_feedrate")
 #define probe_offsets_checksum       CHECKSUM("probe_offsets")
 #define wait_for_probe_checksum      CHECKSUM("wait_for_probe")
+#define home_before_probe_checksum   CHECKSUM("home_before_probe")
 #define center_zero_checksum         CHECKSUM("center_zero")
 #define circular_bed_checksum        CHECKSUM("circular_bed")
 #define cal_offset_x_checksum        CHECKSUM("cal_offset_x")
 #define cal_offset_y_checksum        CHECKSUM("cal_offset_y")
 
+#define NOHOME                       0
+#define HOMEXY                       1
+#define HOMEXYZ                      2
 
 #define cols_checksum                CHECKSUM("cols")
 #define rows_checksum                CHECKSUM("rows")
@@ -142,7 +155,21 @@ bool ZGridStrategy::handleConfig()
     this->numRows = THEKERNEL->config->value(leveling_strategy_checksum, ZGrid_leveling_checksum, rows_checksum)->by_default(5)->as_number();
     this->numCols = THEKERNEL->config->value(leveling_strategy_checksum, ZGrid_leveling_checksum, cols_checksum)->by_default(5)->as_number();
 
-    this->wait_for_probe = THEKERNEL->config->value(leveling_strategy_checksum, ZGrid_leveling_checksum, wait_for_probe_checksum)->by_default(false)->as_bool();
+    this->wait_for_probe   = THEKERNEL->config->value(leveling_strategy_checksum, ZGrid_leveling_checksum, wait_for_probe_checksum)->by_default(true)->as_bool();  // Morgan default = true
+
+    std::string home_mode  = THEKERNEL->config->value(leveling_strategy_checksum, ZGrid_leveling_checksum, home_before_probe_checksum)->by_default("homexyz")->as_string();
+    if (home_mode.compare("nohome") == 0) {
+        this->home_before_probe = NOHOME;
+    }
+    else if (home_mode.compare("homexy") == 0) {
+        this->home_before_probe = HOMEXY;
+    }
+    else { // Default
+        this->home_before_probe = HOMEXYZ;
+    }
+
+
+    //this->home_before_probe = THEKERNEL->config->value(leveling_strategy_checksum, ZGrid_leveling_checksum, home_before_probe_checksum)->by_default(HOMEXYZ)->as_number();  // Morgan default = HOMEXYZ
 
     this->center_zero = THEKERNEL->config->value(leveling_strategy_checksum, ZGrid_leveling_checksum, center_zero_checksum)->by_default(false)->as_bool();
     this->circular_bed = THEKERNEL->config->value(leveling_strategy_checksum, ZGrid_leveling_checksum, circular_bed_checksum)->by_default(false)->as_bool();
@@ -218,6 +245,8 @@ bool ZGridStrategy::handleGcode(Gcode *gcode)
             // M370: Clear current ZGrid for calibration, and move to first position
             case 370: {
                 this->setAdjustFunction(false); // Disable leveling code
+                this->cal[Z_AXIS] = std::get<Z_AXIS>(this->probe_offsets) + zprobe->getProbeHeight();
+
 
                 if(gcode->has_letter('X'))  // Rows (X)
                     this->numRows = gcode->get_value('X');
@@ -343,8 +372,6 @@ bool ZGridStrategy::handleGcode(Gcode *gcode)
                 gcode->stream->printf(";Probe offsets:\n");
                 std::tie(x, y, z) = probe_offsets;
                 gcode->stream->printf("M565 X%1.5f Y%1.5f Z%1.5f\n", x, y, z);
-
-                gcode->mark_as_taken();
                 break;
             }
 
@@ -447,7 +474,7 @@ void ZGridStrategy::setZoffset(float zval)
 
 bool ZGridStrategy::doProbing(StreamOutput *stream)  // probed calibration
 {
-    // home first
+    // home first using selected mode: NOHOME, HOMEXY, HOMEXYZ
     this->homexyz();
 
     // deactivate correction during moves
@@ -482,24 +509,27 @@ bool ZGridStrategy::doProbing(StreamOutput *stream)  // probed calibration
     for (int probes = 0; probes < probe_points; probes++){
         int pindex = 0;
 
-        float z = 5.0f - zprobe->probeDistance((this->cal[X_AXIS] + this->cal_offset_x)-std::get<X_AXIS>(this->probe_offsets),
+        // z = z home offset - probed distance
+        float z = getZhomeoffset() -zprobe->probeDistance((this->cal[X_AXIS] + this->cal_offset_x)-std::get<X_AXIS>(this->probe_offsets),
                                                (this->cal[Y_AXIS] + this->cal_offset_y)-std::get<Y_AXIS>(this->probe_offsets));
 
         pindex = int(this->cal[X_AXIS]/this->bed_div_x + 0.25)*this->numCols + int(this->cal[Y_AXIS]/this->bed_div_y + 0.25);
 
-        if (probes == (probe_points-1) && this->wait_for_probe){  // Only move to removal position if probe confirmation was selected
-            this->cal[X_AXIS] = this->bed_x/2.0f;                 // Else machine will return to first probe position when done
-            this->cal[Y_AXIS] = this->bed_y/2.0f;
-            this->cal[Z_AXIS] = this->bed_z/2.0f;                 // Position head for probe removal
-        } else {
-            this->next_cal();                                     // to not cause damage to machine due to Z-offset
-        }
-        this->move(this->cal, slow_rate);                         // move to the next position
+        this->next_cal();                                        // Calculate next calibration position
 
-        this->pData[pindex] = z ;                                 // save the offset
+        this->pData[pindex] = z ;                                // save the offset
     }
 
-    stream->printf("\nCalibration done.  Please remove probe\n");
+    stream->printf("\nCalibration done.\n");
+    if (this->wait_for_probe) {                                  // Only do this it the config calls for probe removal position
+        this->cal[X_AXIS] = this->bed_x/2.0f;
+        this->cal[Y_AXIS] = this->bed_y/2.0f;
+        this->cal[Z_AXIS] = this->bed_z/2.0f;                    // Position head for probe removal
+        this->move(this->cal, slow_rate);
+
+        stream->printf("Please remove probe\n");
+
+    }
 
     // activate correction
     this->normalize_grid();
@@ -534,33 +564,42 @@ void ZGridStrategy::normalize_grid()
 
 void ZGridStrategy::homexyz()
 {
-    Gcode gc("G28", &(StreamOutput::NullStream));
-    THEKERNEL->call_event(ON_GCODE_RECEIVED, &gc);
+
+  switch(this->home_before_probe) {
+    case NOHOME : return;
+
+    case HOMEXY : {
+        Gcode gc("G28 X0 Y0", &(StreamOutput::NullStream));
+        THEKERNEL->call_event(ON_GCODE_RECEIVED, &gc);
+        break;
+    }
+
+    case HOMEXYZ : {
+        Gcode gc("G28", &(StreamOutput::NullStream));
+        THEKERNEL->call_event(ON_GCODE_RECEIVED, &gc);
+        break;
+    }
+  }
 }
 
 void ZGridStrategy::move(float *position, float feed)
 {
-    char cmd[64];
+    // translate the position for non standard cartesian spaces (cal_offset)
+    zprobe->coordinated_move(position[0] + this->cal_offset_x, position[1] + this->cal_offset_y, position[2], feed); // use specified feedrate (mm/sec)
 
-    // Assemble Gcode to add onto the queue.  Also translate the position for non standard cartesian spaces (cal_offset)
-    snprintf(cmd, sizeof(cmd), "G0 X%1.3f Y%1.3f Z%1.3f F%1.1f", position[0] + this->cal_offset_x, position[1] + this->cal_offset_y, position[2], feed * 60); // use specified feedrate (mm/sec)
-
-    THEKERNEL->streams->printf("DEBUG: move: %s cent: %i\n", cmd, this->center_zero);
-
-    Gcode gc(cmd, &(StreamOutput::NullStream));
-    THEKERNEL->robot->on_gcode_received(&gc); // send to robot directly
+    //THEKERNEL->streams->printf("DEBUG: move: %s cent: %i\n", cmd, this->center_zero);
 }
 
 
 void ZGridStrategy::next_cal(void){
-    if (int(this->cal[X_AXIS] / this->bed_div_x) % 2 != 0){  // Odd row
+    if ((((int) roundf(this->cal[X_AXIS] / this->bed_div_x)) & 1) != 0){  // Odd row
         this->cal[Y_AXIS] -= this->bed_div_y;
-        if (this->cal[Y_AXIS] < 0.0F){
+        if (this->cal[Y_AXIS] < (0.0F - (bed_div_y / 2.0f))){
 
-            THEKERNEL->streams->printf("DEBUG: Y (%f) < cond (%f)\n",this->cal[Y_AXIS], 0.0F);
+            //THEKERNEL->streams->printf("DEBUG: Y (%f) < cond (%f)\n",this->cal[Y_AXIS], 0.0F);
 
             this->cal[X_AXIS] += bed_div_x;
-            if (this->cal[X_AXIS] > this->bed_x){
+            if (this->cal[X_AXIS] > (this->bed_x + (this->bed_div_x / 2.0f))){
                 this->cal[X_AXIS] = 0.0F;
                 this->cal[Y_AXIS] = 0.0F;
             }
@@ -570,12 +609,12 @@ void ZGridStrategy::next_cal(void){
     }
     else {                                          // Even row (0 is an even row - starting point)
         this->cal[Y_AXIS] += bed_div_y;
-      if (this->cal[Y_AXIS] > this->bed_y){
+      if (this->cal[Y_AXIS] > (this->bed_y + (bed_div_y / 2.0f))){
 
-            THEKERNEL->streams->printf("DEBUG: Y (%f) > cond (%f)\n",this->cal[Y_AXIS], this->bed_y);
+            //THEKERNEL->streams->printf("DEBUG: Y (%f) > cond (%f)\n",this->cal[Y_AXIS], this->bed_y);
 
             this->cal[X_AXIS] += bed_div_x;
-            if (this->cal[X_AXIS] > bed_x){
+            if (this->cal[X_AXIS] > (this->bed_x + (this->bed_div_x / 2.0f))){
                 this->cal[X_AXIS] = 0.0F;
                 this->cal[Y_AXIS] = 0.0F;
             }
@@ -612,26 +651,21 @@ float ZGridStrategy::getZOffset(float X, float Y)
 
     float dCartX1, dCartX2;
 
-    int xIndex = (int) xdiff;                  // Get the current sector (X)
-    int yIndex = (int) ydiff;                  // Get the current sector (Y)
+    // Get floor of xdiff.  Note that (int) of a negative number is its
+    // ceiling, not its floor.
 
-    // * Care taken for table outside boundary
-    // * Returns zero output when values are outside table boundary
-    if(xIndex < 0 || xIndex > (this->numRows - 1) || yIndex < 0
-       || yIndex > (this->numCols - 1))
-    {
-      return (0);
-    }
+    int xIndex = (int)(floorf(xdiff));	// Get the current sector (X)
+    int yIndex = (int)(floorf(ydiff));	// Get the current sector (Y)
 
-    if (xIndex == (this->numRows - 1))
-        xIndex2 = xIndex;
-    else
-        xIndex2 = xIndex+1;
+    // Index bounds limited to be inside the table
+    if (xIndex < 0) xIndex = 0;
+    else if (xIndex > (this->numRows - 2)) xIndex = this->numRows - 2;
 
-    if (yIndex == (this->numCols - 1))
-        yIndex2 = yIndex;
-    else
-        yIndex2 = yIndex+1;
+    if (yIndex < 0) yIndex = 0;
+    else if (yIndex > (this->numCols - 2)) yIndex = this->numCols - 2;
+
+    xIndex2 = xIndex+1;
+    yIndex2 = yIndex+1;
 
     xdiff -= xIndex;                    // Find floating point
     ydiff -= yIndex;                    // Find floating point

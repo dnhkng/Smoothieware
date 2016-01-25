@@ -17,7 +17,6 @@
 #include "libs/StreamOutput.h"
 #include "Gcode.h"
 #include "checksumm.h"
-#include "Pauser.h"
 #include "Config.h"
 #include "ConfigValue.h"
 #include "SDFAT.h"
@@ -29,6 +28,7 @@
 #include "PlayerPublicAccess.h"
 #include "TemperatureControlPublicAccess.h"
 #include "TemperatureControlPool.h"
+#include "ExtruderPublicAccess.h"
 
 #include <cstddef>
 #include <cmath>
@@ -42,11 +42,6 @@
 #define before_resume_gcode_checksum      CHECKSUM("before_resume_gcode")
 #define leave_heaters_on_suspend_checksum CHECKSUM("leave_heaters_on_suspend")
 
-
-#define extruder_checksum                 CHECKSUM("extruder")
-#define save_state_checksum               CHECKSUM("save_state")
-#define restore_state_checksum            CHECKSUM("restore_state")
-
 extern SDFAT mounter;
 
 Player::Player()
@@ -56,7 +51,6 @@ Player::Player()
     this->booted = false;
     this->elapsed_secs = 0;
     this->reply_stream = nullptr;
-    this->halted= false;
     this->suspended= false;
     this->suspend_loops= 0;
 }
@@ -69,7 +63,6 @@ void Player::on_module_loaded()
     this->register_for_event(ON_GET_PUBLIC_DATA);
     this->register_for_event(ON_SET_PUBLIC_DATA);
     this->register_for_event(ON_GCODE_RECEIVED);
-    this->register_for_event(ON_HALT);
 
     this->on_boot_gcode = THEKERNEL->config->value(on_boot_gcode_checksum)->by_default("/sd/on_boot.gcode")->as_string();
     this->on_boot_gcode_enable = THEKERNEL->config->value(on_boot_gcode_enable_checksum)->by_default(true)->as_bool();
@@ -79,11 +72,6 @@ void Player::on_module_loaded()
     std::replace( this->after_suspend_gcode.begin(), this->after_suspend_gcode.end(), '_', ' '); // replace _ with space
     std::replace( this->before_resume_gcode.begin(), this->before_resume_gcode.end(), '_', ' '); // replace _ with space
     this->leave_heaters_on = THEKERNEL->config->value(leave_heaters_on_suspend_checksum)->by_default(false)->as_bool();
-}
-
-void Player::on_halt(void *arg)
-{
-    halted= (arg == nullptr);
 }
 
 void Player::on_second_tick(void *)
@@ -112,12 +100,10 @@ void Player::on_gcode_received(void *argument)
     string args = get_arguments(gcode->get_command());
     if (gcode->has_m) {
         if (gcode->m == 21) { // Dummy code; makes Octoprint happy -- supposed to initialize SD card
-            gcode->mark_as_taken();
             mounter.remount();
             gcode->stream->printf("SD card ok\r\n");
 
         } else if (gcode->m == 23) { // select file
-            gcode->mark_as_taken();
             this->filename = "/sd/" + args; // filename is whatever is in args
             this->current_stream = &(StreamOutput::NullStream);
 
@@ -149,7 +135,6 @@ void Player::on_gcode_received(void *argument)
             this->elapsed_secs = 0;
 
         } else if (gcode->m == 24) { // start print
-            gcode->mark_as_taken();
             if (this->current_file_handler != NULL) {
                 this->playing_file = true;
                 // this would be a problem if the stream goes away before the file has finished,
@@ -159,11 +144,9 @@ void Player::on_gcode_received(void *argument)
             }
 
         } else if (gcode->m == 25) { // pause print
-            gcode->mark_as_taken();
             this->playing_file = false;
 
         } else if (gcode->m == 26) { // Reset print. Slightly different than M26 in Marlin and the rest
-            gcode->mark_as_taken();
             if(this->current_file_handler != NULL) {
                 string currentfn = this->filename.c_str();
                 unsigned long old_size = this->file_size;
@@ -188,11 +171,9 @@ void Player::on_gcode_received(void *argument)
             }
 
         } else if (gcode->m == 27) { // report print progress, in format used by Marlin
-            gcode->mark_as_taken();
             progress_command("-b", gcode->stream);
 
         } else if (gcode->m == 32) { // select file and start print
-            gcode->mark_as_taken();
             // Get filename
             this->filename = "/sd/" + args; // filename is whatever is in args including spaces
             this->current_stream = &(StreamOutput::NullStream);
@@ -221,11 +202,23 @@ void Player::on_gcode_received(void *argument)
             this->played_cnt = 0;
             this->elapsed_secs = 0;
 
-        } else if (gcode->m == 600) { // suspend print, Not entirely Marlin compliant
-            this->suspend_command("", &(StreamOutput::NullStream));
+        } else if (gcode->m == 600) { // suspend print, Not entirely Marlin compliant, M600.1 will leave the heaters on
+            this->suspend_command((gcode->subcode == 1)?"h":"", gcode->stream);
 
         } else if (gcode->m == 601) { // resume print
-            this->resume_command("", &(StreamOutput::NullStream));
+            this->resume_command("", gcode->stream);
+        }
+
+    }else if(gcode->has_g) {
+        if(gcode->g == 28) { // homing cancels suspend
+            if(this->suspended) {
+                // clean up
+                this->suspended= false;
+                THEKERNEL->robot->pop_state();
+                this->saved_temperatures.clear();
+                this->was_playing_file= false;
+                this->suspend_loops= 0;
+            }
         }
     }
 }
@@ -233,7 +226,7 @@ void Player::on_gcode_received(void *argument)
 // When a new line is received, check if it is a command, and if it is, act upon it
 void Player::on_console_line_received( void *argument )
 {
-    if(halted) return; // if in halted state ignore any commands
+    if(THEKERNEL->is_halted()) return; // if in halted state ignore any commands
 
     SerialMessage new_message = *static_cast<SerialMessage *>(argument);
 
@@ -375,7 +368,7 @@ void Player::abort_command( string parameters, StreamOutput *stream )
         // now the position will think it is at the last received pos, so we need to do FK to get the actuator position and reset the current position
         THEKERNEL->robot->reset_position_from_current_actuator_position();
     }
-    stream->printf("Aborted playing or paused file\r\n");
+    stream->printf("Aborted playing or paused file. Please turn any heaters off manually\r\n");
 }
 
 void Player::on_main_loop(void *argument)
@@ -398,7 +391,7 @@ void Player::on_main_loop(void *argument)
     }
 
     if( this->playing_file ) {
-        if(halted) {
+        if(THEKERNEL->is_halted()) {
             abort_command("1", &(StreamOutput::NullStream));
             return;
         }
@@ -505,7 +498,10 @@ void Player::suspend_command(string parameters, StreamOutput *stream )
         return;
     }
 
-    stream->printf("ok Suspending print, waiting for queue to empty...\n");
+    stream->printf("Suspending print, waiting for queue to empty...\n");
+
+    // override the leave_heaters_on setting
+    this->override_leave_heaters_on= (parameters == "h");
 
     suspended= true;
     if( this->playing_file ) {
@@ -520,16 +516,17 @@ void Player::suspend_command(string parameters, StreamOutput *stream )
 
     // we need to allow main loop to cycle a few times to clear any buffered commands in the serial streams etc
     suspend_loops= 10;
-    suspend_stream= stream;
 }
 
 // this completes the suspend
 void Player::suspend_part2()
 {
+    //  need to use streams here as the original stream may have changed
+    THEKERNEL->streams->printf("// Waiting for queue to empty (Host must stop sending)...\n");
     // wait for queue to empty
     THEKERNEL->conveyor->wait_for_empty_queue();
 
-    suspend_stream->printf("Saving current state...\n");
+    THEKERNEL->streams->printf("// Saving current state...\n");
 
     // save current XYZ position
     THEKERNEL->robot->get_axis_position(this->saved_position);
@@ -537,28 +534,25 @@ void Player::suspend_part2()
     // save current extruder state
     PublicData::set_value( extruder_checksum, save_state_checksum, nullptr );
 
-    // save state
-    this->saved_inch_mode= THEKERNEL->robot->inch_mode;
-    this->saved_absolute_mode= THEKERNEL->robot->absolute_mode;
-    this->saved_feed_rate= THEKERNEL->robot->get_feed_rate();
+    // save state use M120
+    THEKERNEL->robot->push_state();
 
     // TODO retract by optional amount...
 
     this->saved_temperatures.clear();
-    if(!this->leave_heaters_on) {
-        // save current temperatures
-        for(auto m : THEKERNEL->temperature_control_pool->get_controllers()) {
+    if(!this->leave_heaters_on && !this->override_leave_heaters_on) {
+        // save current temperatures, get a vector of all the controllers data
+        std::vector<struct pad_temperature> controllers;
+        bool ok = PublicData::get_value(temperature_control_checksum, poll_controls_checksum, &controllers);
+        if (ok) {
             // query each heater and save the target temperature if on
-            void *p;
-            if(PublicData::get_value( temperature_control_checksum, m, current_temperature_checksum, &p )) {
-                struct pad_temperature *temp= static_cast<struct pad_temperature *>(p);
+            for (auto &c : controllers) {
                 // TODO see if in exclude list
-                if(temp != nullptr && temp->target_temperature > 0) {
-                    this->saved_temperatures[m]= temp->target_temperature;
+                if(c.target_temperature > 0) {
+                    this->saved_temperatures[c.id]= c.target_temperature;
                 }
             }
         }
-
 
         // turn off heaters that were on
         for(auto& h : this->saved_temperatures) {
@@ -575,7 +569,7 @@ void Player::suspend_part2()
         THEKERNEL->call_event(ON_CONSOLE_LINE_RECEIVED, &message );
     }
 
-    suspend_stream->printf("Print Suspended, enter resume to continue printing\n");
+    THEKERNEL->streams->printf("// Print Suspended, enter resume to continue printing\n");
 }
 
 /**
@@ -592,16 +586,15 @@ void Player::resume_command(string parameters, StreamOutput *stream )
         return;
     }
 
-    stream->printf("ok resuming print...\n");
-
-    // set heaters to saved temps
-    for(auto& h : this->saved_temperatures) {
-        float t= h.second;
-        PublicData::set_value( temperature_control_checksum, h.first, &t );
-    }
+    stream->printf("resuming print...\n");
 
     // wait for them to reach temp
     if(!this->saved_temperatures.empty()) {
+        // set heaters to saved temps
+        for(auto& h : this->saved_temperatures) {
+            float t= h.second;
+            PublicData::set_value( temperature_control_checksum, h.first, &t );
+        }
         stream->printf("Waiting for heaters...\n");
         bool wait= true;
         uint32_t tus= us_ticker_read(); // mbed call
@@ -615,17 +608,26 @@ void Player::resume_command(string parameters, StreamOutput *stream )
             }
 
             for(auto& h : this->saved_temperatures) {
-                void *p;
-                if(PublicData::get_value( temperature_control_checksum, h.first, current_temperature_checksum, &p )) {
-                    struct pad_temperature *temp= static_cast<struct pad_temperature *>(p);
-                    if(timeup) stream->printf("%s:%3.1f /%3.1f @%d ", temp->designator.c_str(), temp->current_temperature, ((temp->target_temperature == -1) ? 0.0 : temp->target_temperature), temp->pwm);
-                    wait= wait || (temp->current_temperature < h.second);
+                struct pad_temperature temp;
+                if(PublicData::get_value( temperature_control_checksum, current_temperature_checksum, h.first, &temp )) {
+                    if(timeup)
+                        stream->printf("%s:%3.1f /%3.1f @%d ", temp.designator.c_str(), temp.current_temperature, ((temp.target_temperature == -1) ? 0.0 : temp.target_temperature), temp.pwm);
+                    wait= wait || (temp.current_temperature < h.second);
                 }
             }
             if(timeup) stream->printf("\n");
 
             if(wait)
                 THEKERNEL->call_event(ON_IDLE, this);
+
+            if(THEKERNEL->is_halted()) {
+                // abort temp wait and rest of resume
+                THEKERNEL->streams->printf("Resume aborted by kill\n");
+                THEKERNEL->robot->pop_state();
+                this->saved_temperatures.clear();
+                suspended= false;
+                return;
+            }
         }
     }
 
@@ -640,15 +642,18 @@ void Player::resume_command(string parameters, StreamOutput *stream )
 
     // Restore position
     stream->printf("Restoring saved XYZ positions and state...\n");
-    THEKERNEL->robot->inch_mode= saved_inch_mode;
-    THEKERNEL->robot->absolute_mode= saved_absolute_mode;
-    char buf[128];
+    THEKERNEL->robot->pop_state();
+    bool abs_mode= THEKERNEL->robot->absolute_mode; // what mode we were in
+    // force absolute mode for restoring position, then set to the saved relative/absolute mode
+    THEKERNEL->robot->absolute_mode= true;
     {
-        int n = snprintf(buf, sizeof(buf), "G1 X%f Y%f Z%f F%f", saved_position[0], saved_position[1], saved_position[2], saved_feed_rate);
+        char buf[128];
+        int n = snprintf(buf, sizeof(buf), "G1 X%f Y%f Z%f", saved_position[0], saved_position[1], saved_position[2]);
         string g(buf, n);
         Gcode gcode(g, &(StreamOutput::NullStream));
         THEKERNEL->call_event(ON_GCODE_RECEIVED, &gcode );
     }
+    THEKERNEL->robot->absolute_mode= abs_mode;
 
     // restore extruder state
     PublicData::set_value( extruder_checksum, restore_state_checksum, nullptr );
@@ -657,6 +662,7 @@ void Player::resume_command(string parameters, StreamOutput *stream )
 
     if(this->was_playing_file) {
         this->playing_file = true;
+        this->was_playing_file= false;
     }else{
         // Send resume to host
         THEKERNEL->streams->printf("// action:resume\r\n");

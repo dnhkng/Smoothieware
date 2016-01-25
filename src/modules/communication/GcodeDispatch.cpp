@@ -8,8 +8,8 @@
 #include "GcodeDispatch.h"
 
 #include "libs/Kernel.h"
+#include "Robot.h"
 #include "utils/Gcode.h"
-#include "Pauser.h"
 #include "libs/nuts_bolts.h"
 #include "modules/robot/Conveyor.h"
 #include "libs/SerialMessage.h"
@@ -22,13 +22,16 @@
 #include "ConfigValue.h"
 #include "PublicDataRequest.h"
 #include "PublicData.h"
+#include "SimpleShell.h"
+#include "utils.h"
+#include "LPC17xx.h"
 
 #define return_error_on_unhandled_gcode_checksum    CHECKSUM("return_error_on_unhandled_gcode")
 #define panel_display_message_checksum CHECKSUM("display_message")
 #define panel_checksum             CHECKSUM("panel")
 
 // goes in Flash, list of Mxxx codes that are allowed when in Halted state
-static const int allowed_mcodes[]= {105,114}; // get temp, get pos
+static const int allowed_mcodes[]= {105,114,119,80,81,911,503,106,107}; // get temp, get pos, get endstops etc
 static bool is_allowed_mcode(int m) {
     for (size_t i = 0; i < sizeof(allowed_mcodes)/sizeof(int); ++i) {
         if(allowed_mcodes[i] == m) return true;
@@ -38,24 +41,15 @@ static bool is_allowed_mcode(int m) {
 
 GcodeDispatch::GcodeDispatch()
 {
-    halted= false;
     uploading = false;
     currentline = -1;
-    last_g= 255;
+    modal_group_1= 0;
 }
 
 // Called when the module has just been loaded
 void GcodeDispatch::on_module_loaded()
 {
-    return_error_on_unhandled_gcode = THEKERNEL->config->value( return_error_on_unhandled_gcode_checksum )->by_default(false)->as_bool();
     this->register_for_event(ON_CONSOLE_LINE_RECEIVED);
-    this->register_for_event(ON_HALT);
-}
-
-void GcodeDispatch::on_halt(void *arg)
-{
-    // set halt stream and ignore everything until M999
-    this->halted= (arg == nullptr);
 }
 
 // When a command is received, if it is a Gcode, dispatch it as an object via an event
@@ -134,15 +128,15 @@ try_again:
                 }
 
 
-                if(!uploading) {
-                    //Prepare gcode for dispatch
+                if(!uploading || upload_stream != new_message.stream) {
+                    // Prepare gcode for dispatch
                     Gcode *gcode = new Gcode(single_command, new_message.stream);
 
-                    if(halted) {
+                    if(THEKERNEL->is_halted()) {
                         // we ignore all commands until M999, unless it is in the exceptions list (like M105 get temp)
                         if(gcode->has_m && gcode->m == 999) {
                             THEKERNEL->call_event(ON_HALT, (void *)1); // clears on_halt
-                            halted= false;
+
                             // fall through and pass onto other modules
 
                         }else if(!is_allowed_mcode(gcode->m)) {
@@ -154,7 +148,41 @@ try_again:
                     }
 
                     if(gcode->has_g) {
-                        last_g= gcode->g;
+                        if(gcode->g == 53) { // G53 makes next movement command use machine coordinates
+                            // this is ugly to implement as there may or may not be a G0/G1 on the same line
+                            // valid vesion seem to include G53 G0 X1 Y2 Z3 G53 X1 Y2
+                            if(possible_command.empty()) {
+                                // use last gcode G1 or G0 if none on the line, and pass through as if it was a G0/G1
+                                // TODO it is really an error if the last is not G0 thru G3
+                                if(modal_group_1 > 3) {
+                                    delete gcode;
+                                    new_message.stream->printf("ok - Invalid G53\r\n");
+                                    return;
+                                }
+                                // use last G0 or G1
+                                gcode->g= modal_group_1;
+
+                            }else{
+                                delete gcode;
+                                // extract next G0/G1 from the rest of the line, ignore if it is not one of these
+                                gcode = new Gcode(possible_command, new_message.stream);
+                                possible_command= "";
+                                if(!gcode->has_g || gcode->g > 1) {
+                                    // not G0 or G1 so ignore it as it is invalid
+                                    delete gcode;
+                                    new_message.stream->printf("ok - Invalid G53\r\n");
+                                    return;
+                                }
+                            }
+                            // makes it handle the parameters as a machine position
+                            THEKERNEL->robot->next_command_is_MCS= true;
+
+                        }
+
+                        // remember last modal group 1 code
+                        if(gcode->g < 4) {
+                            modal_group_1= gcode->g;
+                        }
                     }
 
                     if(gcode->has_m) {
@@ -171,6 +199,10 @@ try_again:
                                 } else {
                                     new_message.stream->printf("open failed, File: %s.\r\nok\r\n", this->upload_filename.c_str());
                                 }
+
+                                // only save stuff from this stream
+                                upload_stream= new_message.stream;
+
                                 //printf("Start Uploading file: %s, %p\n", upload_filename.c_str(), upload_fd);
                                 continue;
 
@@ -191,9 +223,34 @@ try_again:
                                 return;
                             }
 
+                            case 1000: // M1000 is a special comanad that will pass thru the raw lowercased command to the simpleshell (for hosts that do not allow such things)
+                            {
+                                // reconstruct entire command line again
+                                string str= single_command.substr(5) + possible_command;
+                                while(is_whitespace(str.front())){ str= str.substr(1); } // strip leading whitespace
+
+                                delete gcode;
+
+                                if(str.empty()) {
+                                    SimpleShell::parse_command("help", "", new_message.stream);
+
+                                }else{
+                                    string args= lc(str);
+                                    string cmd = shift_parameter(args);
+                                    // find command and execute it
+                                    if(!SimpleShell::parse_command(cmd.c_str(), args, new_message.stream)) {
+                                        new_message.stream->printf("Command not found: %s\n", cmd.c_str());
+                                    }
+                                }
+
+                                new_message.stream->printf("ok\r\n");
+                                return;
+                            }
+
                             case 500: // M500 save volatile settings to config-override
                                 THEKERNEL->conveyor->wait_for_empty_queue(); //just to be safe as it can take a while to run
                                 //remove(THEKERNEL->config_override_filename()); // seems to cause a hang every now and then
+                                __disable_irq();
                                 {
                                     FileStream fs(THEKERNEL->config_override_filename());
                                     fs.printf("; DO NOT EDIT THIS FILE\n");
@@ -205,13 +262,14 @@ try_again:
                                 THEKERNEL->call_event(ON_GCODE_RECEIVED, gcode );
                                 delete gcode->stream;
                                 delete gcode;
+                                __enable_irq();
                                 new_message.stream->printf("Settings Stored to %s\r\nok\r\n", THEKERNEL->config_override_filename());
                                 continue;
 
                             case 502: // M502 deletes config-override so everything defaults to what is in config
                                 remove(THEKERNEL->config_override_filename());
-                                new_message.stream->printf("config override file deleted %s, reboot needed\r\nok\r\n", THEKERNEL->config_override_filename());
                                 delete gcode;
+                                new_message.stream->printf("config override file deleted %s, reboot needed\r\nok\r\n", THEKERNEL->config_override_filename());
                                 continue;
 
                             case 503: { // M503 display live settings and indicates if there is an override file
@@ -235,9 +293,7 @@ try_again:
                     if(gcode->add_nl)
                         new_message.stream->printf("\r\n");
 
-                    if( return_error_on_unhandled_gcode == true && gcode->accepted_by_module == false)
-                        new_message.stream->printf("ok (command unclaimed)\r\n");
-                    else if(!gcode->txt_after_ok.empty()) {
+                    if(!gcode->txt_after_ok.empty()) {
                         new_message.stream->printf("ok %s\r\n", gcode->txt_after_ok.c_str());
                         gcode->txt_after_ok.clear();
                     } else
@@ -246,13 +302,14 @@ try_again:
                     delete gcode;
 
                 } else {
-                    // we are uploading a file so save it
+                    // we are uploading and it is the upload stream so so save it
                     if(single_command.substr(0, 3) == "M29") {
                         // done uploading, close file
                         fclose(upload_fd);
                         upload_fd = NULL;
                         uploading = false;
                         upload_filename.clear();
+                        upload_stream= nullptr;
                         new_message.stream->printf("Done saving file.\r\nok\r\n");
                         continue;
                     }
@@ -292,14 +349,9 @@ try_again:
         }
 
     } else if( (n=possible_command.find_first_of("XYZF")) == 0 || (first_char == ' ' && n != string::npos) ) {
-        // handle pycam syntax, use last G0 or G1 and resubmit if an X Y Z or F is found on its own line
-        if(last_g != 0 && last_g != 1) {
-            //if no last G1 or G0 ignore
-            //THEKERNEL->streams->printf("ignored: %s\r\n", possible_command.c_str());
-            return;
-        }
+        // handle pycam syntax, use last modal group 1 command and resubmit if an X Y Z or F is found on its own line
         char buf[6];
-        snprintf(buf, sizeof(buf), "G%d ", last_g);
+        snprintf(buf, sizeof(buf), "G%d ", modal_group_1);
         possible_command.insert(0, buf);
         goto try_again;
 

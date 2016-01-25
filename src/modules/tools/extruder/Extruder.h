@@ -28,8 +28,6 @@ class Extruder : public Tool {
         void     on_gcode_execute(void* argument);
         void     on_block_begin(void* argument);
         void     on_block_end(void* argument);
-        void     on_play(void* argument);
-        void     on_pause(void* argument);
         void     on_halt(void* argument);
         void     on_speed_change(void* argument);
         void     acceleration_tick(void);
@@ -40,6 +38,7 @@ class Extruder : public Tool {
         void on_get_public_data(void* argument);
         void on_set_public_data(void* argument);
         uint32_t rate_increase() const;
+        float check_max_speeds(float target, float isecs);
 
         StepperMotor*  stepper_motor;
         Pin            step_pin;                     // Step pin for the stepper driver
@@ -61,7 +60,9 @@ class Extruder : public Tool {
 
         float saved_current_position;
         float volumetric_multiplier;
-        float feed_rate;               // mm/sec for SOLO moves only
+        float feed_rate;                // default rate mm/sec for SOLO moves only
+        float milestone_last_position;  // used for calculating volumemetric rate, last position in mm³
+        float max_volumetric_rate;      // used for calculating volumetric rate in mm³/sec
 
         float travel_ratio;
         float travel_distance;
@@ -77,10 +78,10 @@ class Extruder : public Tool {
             char mode:3;        // extruder motion mode,  OFF, SOLO, or FOLLOW
             bool absolute_mode:1; // absolute/relative coordinate mode switch
             bool saved_absolute_mode:1;
-            bool paused:1;
             bool single_config:1;
             bool retracted:1;
             bool cancel_zlift_restore:1; // hack to stop a G11 zlift restore from overring an absolute Z setting
+            bool milestone_absolute_mode:1;
         };
 
 

@@ -22,18 +22,22 @@
 #include "checksumm.h"
 #include "PublicData.h"
 #include "Gcode.h"
-//#include "StepTicker.h"
+#include "Robot.h"
+#include "ToolManagerPublicAccess.h"
+#include "GcodeDispatch.h"
 
-#include "modules/tools/temperaturecontrol/TemperatureControlPublicAccess.h"
-#include "modules/robot/RobotPublicAccess.h"
+#include "TemperatureControlPublicAccess.h"
 #include "NetworkPublicAccess.h"
 #include "platform_memory.h"
 #include "SwitchPublicAccess.h"
 #include "SDFAT.h"
 #include "Thermistor.h"
+#include "md5.h"
 
 #include "system_LPC17xx.h"
 #include "LPC17xx.h"
+
+#include "mbed.h" // for wait_ms()
 
 extern unsigned int g_maximumHeapAddress;
 
@@ -70,6 +74,8 @@ const SimpleShell::ptentry_t SimpleShell::commands_table[] = {
     {"save",     SimpleShell::save_command},
     {"remount",  SimpleShell::remount_command},
     {"calc_thermistor", SimpleShell::calc_thermistor_command},
+    {"thermistors", SimpleShell::print_thermistors_command},
+    {"md5sum",   SimpleShell::md5sum_command},
 
     // unknown command
     {NULL, NULL}
@@ -159,17 +165,14 @@ void SimpleShell::on_gcode_received(void *argument)
 
     if (gcode->has_m) {
         if (gcode->m == 20) { // list sd card
-            gcode->mark_as_taken();
             gcode->stream->printf("Begin file list\r\n");
             ls_command("/sd", gcode->stream);
             gcode->stream->printf("End file list\r\n");
 
         } else if (gcode->m == 30) { // remove file
-            gcode->mark_as_taken();
             rm_command("/sd/" + args, gcode->stream);
 
         } else if(gcode->m == 501) { // load config override
-            gcode->mark_as_taken();
             if(args.empty()) {
                 load_command("/sd/config-override", gcode->stream);
             } else {
@@ -177,7 +180,6 @@ void SimpleShell::on_gcode_received(void *argument)
             }
 
         } else if(gcode->m == 504) { // save to specific config override file
-            gcode->mark_as_taken();
             if(args.empty()) {
                 save_command("/sd/config-override", gcode->stream);
             } else {
@@ -309,13 +311,34 @@ void SimpleShell::cat_command( string parameters, StreamOutput *stream )
 {
     // Get parameters ( filename and line limit )
     string filename          = absolute_from_relative(shift_parameter( parameters ));
-    string limit_paramater   = shift_parameter( parameters );
+    string limit_parameter   = shift_parameter( parameters );
     int limit = -1;
-    if ( limit_paramater != "" ) {
+    int delay= 0;
+    bool send_eof= false;
+    if ( limit_parameter == "-d" ) {
+        string d= shift_parameter( parameters );
         char *e = NULL;
-        limit = strtol(limit_paramater.c_str(), &e, 10);
-        if (e <= limit_paramater.c_str())
+        delay = strtol(d.c_str(), &e, 10);
+        if (e <= d.c_str()) {
+            delay = 0;
+
+        } else {
+            send_eof= true; // we need to terminate file send with an eof
+        }
+
+    }else if ( limit_parameter != "" ) {
+        char *e = NULL;
+        limit = strtol(limit_parameter.c_str(), &e, 10);
+        if (e <= limit_parameter.c_str())
             limit = -1;
+    }
+
+    // we have been asked to delay before cat, probably to allow time to issue upload command
+    while(delay-- > 0) {
+        for (int i = 0; i < 10; ++i) {
+            wait_ms(100);
+            THEKERNEL->call_event(ON_IDLE);
+        }
     }
 
     // Open file
@@ -331,17 +354,23 @@ void SimpleShell::cat_command( string parameters, StreamOutput *stream )
     // Print each line of the file
     while ((c = fgetc (lp)) != EOF) {
         buffer.append((char *)&c, 1);
-        if ( char(c) == '\n' || ++linecnt > 80) {
-            newlines++;
+        if ( c == '\n' || ++linecnt > 80) {
+            if(c == '\n') newlines++;
             stream->puts(buffer.c_str());
             buffer.clear();
             if(linecnt > 80) linecnt = 0;
+            // we need to kick things or they die
+            THEKERNEL->call_event(ON_IDLE);
         }
         if ( newlines == limit ) {
             break;
         }
     };
     fclose(lp);
+
+    if(send_eof) {
+        stream->puts("\032"); // ^Z terminates the upload
+    }
 }
 
 void SimpleShell::upload_command( string parameters, StreamOutput *stream )
@@ -395,6 +424,8 @@ void SimpleShell::upload_command( string parameters, StreamOutput *stream )
                     // HACK ALERT to get around fwrite corruption close and re open for append
                     fclose(fd);
                     fd = fopen(upload_filename.c_str(), "a");
+                    // we need to kick things or they die
+                    THEKERNEL->call_event(ON_IDLE);
                 }
             }
         }
@@ -447,6 +478,8 @@ void SimpleShell::save_command( string parameters, StreamOutput *stream )
         filename = THEKERNEL->config_override_filename();
     }
 
+    THEKERNEL->conveyor->wait_for_empty_queue(); //just to be safe as it can take a while to run
+
     //remove(filename.c_str()); // seems to cause a hang every now and then
     {
         FileStream fs(filename.c_str());
@@ -454,18 +487,20 @@ void SimpleShell::save_command( string parameters, StreamOutput *stream )
         // this also will truncate the existing file instead of deleting it
     }
 
-    // replace stream with one that writes to config-override file
+    // stream that appends to file
     AppendFileStream *gs = new AppendFileStream(filename.c_str());
     // if(!gs->is_open()) {
     //     stream->printf("Unable to open File %s for write\n", filename.c_str());
     //     return;
     // }
 
+    __disable_irq();
     // issue a M500 which will store values in the file stream
     Gcode *gcode = new Gcode("M500", gs);
     THEKERNEL->call_event(ON_GCODE_RECEIVED, gcode );
     delete gs;
     delete gcode;
+    __enable_irq();
 
     stream->printf("Settings Stored to %s\r\n", filename.c_str());
 }
@@ -551,33 +586,84 @@ void SimpleShell::break_command( string parameters, StreamOutput *stream)
     __debugbreak();
 }
 
+static int get_active_tool()
+{
+    void *returned_data;
+    bool ok = PublicData::get_value(tool_manager_checksum, get_active_tool_checksum, &returned_data);
+    if (ok) {
+         int active_tool=  *static_cast<int *>(returned_data);
+        return active_tool;
+    } else {
+        return 0;
+    }
+}
+
 // used to test out the get public data events
 void SimpleShell::get_command( string parameters, StreamOutput *stream)
 {
     string what = shift_parameter( parameters );
-    void *returned_data;
 
     if (what == "temp") {
+        struct pad_temperature temp;
         string type = shift_parameter( parameters );
-        bool ok = PublicData::get_value( temperature_control_checksum, get_checksum(type), current_temperature_checksum, &returned_data );
+        if(type.empty()) {
+            // scan all temperature controls
+            std::vector<struct pad_temperature> controllers;
+            bool ok = PublicData::get_value(temperature_control_checksum, poll_controls_checksum, &controllers);
+            if (ok) {
+                for (auto &c : controllers) {
+                   stream->printf("%s (%d) temp: %f/%f @%d\r\n", c.designator.c_str(), c.id, c.current_temperature, c.target_temperature, c.pwm);
+                }
 
-        if (ok) {
-            struct pad_temperature temp =  *static_cast<struct pad_temperature *>(returned_data);
-            stream->printf("%s temp: %f/%f @%d\r\n", type.c_str(), temp.current_temperature, temp.target_temperature, temp.pwm);
-        } else {
-            stream->printf("%s is not a known temperature device\r\n", type.c_str());
+            } else {
+                stream->printf("no heaters found\r\n");
+            }
+
+        }else{
+            bool ok = PublicData::get_value( temperature_control_checksum, current_temperature_checksum, get_checksum(type), &temp );
+
+            if (ok) {
+                stream->printf("%s temp: %f/%f @%d\r\n", type.c_str(), temp.current_temperature, temp.target_temperature, temp.pwm);
+            } else {
+                stream->printf("%s is not a known temperature device\r\n", type.c_str());
+            }
         }
 
     } else if (what == "pos") {
-        bool ok = PublicData::get_value( robot_checksum, current_position_checksum, &returned_data );
+        // convenience to call all the various M114 variants
+        char buf[64];
+        THEKERNEL->robot->print_position(0, buf, sizeof buf); stream->printf("last %s\n", buf);
+        THEKERNEL->robot->print_position(1, buf, sizeof buf); stream->printf("realtime %s\n", buf);
+        THEKERNEL->robot->print_position(2, buf, sizeof buf); stream->printf("%s\n", buf);
+        THEKERNEL->robot->print_position(3, buf, sizeof buf); stream->printf("%s\n", buf);
+        THEKERNEL->robot->print_position(4, buf, sizeof buf); stream->printf("%s\n", buf);
+        THEKERNEL->robot->print_position(5, buf, sizeof buf); stream->printf("%s\n", buf);
 
-        if (ok) {
-            float *pos = static_cast<float *>(returned_data);
-            stream->printf("Position X: %f, Y: %f, Z: %f\r\n", pos[0], pos[1], pos[2]);
-
-        } else {
-            stream->printf("get pos command failed\r\n");
+    } else if (what == "wcs") {
+        // print the wcs state
+        std::vector<Robot::wcs_t> v= THEKERNEL->robot->get_wcs_state();
+        char current_wcs= std::get<0>(v[0]);
+        stream->printf("current WCS: %s\n", wcs2gcode(current_wcs).c_str());
+        int n= std::get<1>(v[0]);
+        for (int i = 1; i <= n; ++i) {
+            stream->printf("%s: %1.4f, %1.4f, %1.4f\n", wcs2gcode(i-1).c_str(), std::get<0>(v[i]), std::get<1>(v[i]), std::get<2>(v[i]));
         }
+
+        stream->printf("G92: %1.4f, %1.4f, %1.4f\n", std::get<0>(v[n+1]), std::get<1>(v[n+1]), std::get<2>(v[n+1]));
+        stream->printf("ToolOffset: %1.4f, %1.4f, %1.4f\n", std::get<0>(v[n+2]), std::get<1>(v[n+2]), std::get<2>(v[n+2]));
+
+    } else if (what == "state") {
+        // [G0 G54 G17 G21 G90 G94 M0 M5 M9 T0 F0.]
+        stream->printf("[G%d %s G%d G%d G%d G94 T%d F%1.1f]\n",
+            THEKERNEL->gcode_dispatch->get_modal_command(),
+            wcs2gcode(THEKERNEL->robot->get_current_wcs()).c_str(),
+            THEKERNEL->robot->plane_axis_0 == X_AXIS && THEKERNEL->robot->plane_axis_1 == Y_AXIS && THEKERNEL->robot->plane_axis_2 == Z_AXIS ? 17 :
+              THEKERNEL->robot->plane_axis_0 == X_AXIS && THEKERNEL->robot->plane_axis_1 == Z_AXIS && THEKERNEL->robot->plane_axis_2 == Y_AXIS ? 18 :
+              THEKERNEL->robot->plane_axis_0 == Y_AXIS && THEKERNEL->robot->plane_axis_1 == Z_AXIS && THEKERNEL->robot->plane_axis_2 == X_AXIS ? 19 : 17,
+            THEKERNEL->robot->inch_mode ? 20 : 21,
+            THEKERNEL->robot->absolute_mode ? 90 : 91,
+            get_active_tool(),
+            THEKERNEL->robot->get_feed_rate());
     }
 }
 
@@ -594,6 +680,11 @@ void SimpleShell::set_temp_command( string parameters, StreamOutput *stream)
     } else {
         stream->printf("%s is not a known temperature device\r\n", type.c_str());
     }
+}
+
+void SimpleShell::print_thermistors_command( string parameters, StreamOutput *stream)
+{
+    Thermistor::print_predefined_thermistors(stream);
 }
 
 void SimpleShell::calc_thermistor_command( string parameters, StreamOutput *stream)
@@ -651,6 +742,29 @@ void SimpleShell::switch_command( string parameters, StreamOutput *stream)
     }
 }
 
+void SimpleShell::md5sum_command( string parameters, StreamOutput *stream )
+{
+    string filename = absolute_from_relative(parameters);
+
+    // Open file
+    FILE *lp = fopen(filename.c_str(), "r");
+    if (lp == NULL) {
+        stream->printf("File not found: %s\r\n", filename.c_str());
+        return;
+    }
+    MD5 md5;
+    uint8_t buf[64];
+    do {
+        size_t n= fread(buf, 1, sizeof buf, lp);
+        if(n > 0) md5.update(buf, n);
+    } while(!feof(lp));
+
+    stream->printf("%s %s\n", md5.finalize().hexdigest().c_str(), filename.c_str());
+    fclose(lp);
+}
+
+
+
 void SimpleShell::help_command( string parameters, StreamOutput *stream )
 {
     stream->printf("Commands:\r\n");
@@ -679,5 +793,7 @@ void SimpleShell::help_command( string parameters, StreamOutput *stream )
     stream->printf("save [file] - saves a configuration override file as specified filename or as config-override\r\n");
     stream->printf("upload filename - saves a stream of text to the named file\r\n");
     stream->printf("calc_thermistor [-s0] T1,R1,T2,R2,T3,R3 - calculate the Steinhart Hart coefficients for a thermistor\r\n");
+    stream->printf("thermistors - print out the predefined thermistors\r\n");
+    stream->printf("md5sum file - prints md5 sum of the given file\r\n");
 }
 
